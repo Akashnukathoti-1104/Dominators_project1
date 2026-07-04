@@ -390,6 +390,71 @@
         </div>
     </footer>
 
+    <!-- ============================================================
+         VOICE ASSIST — floating button + guided step-by-step modal
+         For citizens who can't read/write or aren't comfortable with
+         forms: speaks each question aloud and listens for the answer.
+         ============================================================ -->
+    <button id="voice-fab" onclick="openVoiceAssist()" aria-label="Voice Assist — submit by speaking">
+        <i class="fas fa-microphone"></i>
+        <span class="voice-fab-label">Speak</span>
+    </button>
+
+    <div id="voice-modal-overlay">
+        <div class="voice-card">
+            <button id="voice-close-btn" onclick="closeVoiceAssist()" aria-label="Close"><i class="fas fa-xmark"></i></button>
+
+            <div id="voice-lang-picker">
+                <p class="voice-lang-title">Choose your language / अपनी भाषा चुनें / మీ భాషను ఎంచుకోండి</p>
+                <div class="voice-lang-grid">
+                    <button class="voice-lang-btn" data-lang="en-IN" onclick="selectVoiceLanguage('en-IN')">
+                        <i class="fas fa-language"></i><span>English</span>
+                    </button>
+                    <button class="voice-lang-btn" data-lang="hi-IN" onclick="selectVoiceLanguage('hi-IN')">
+                        <i class="fas fa-language"></i><span>हिंदी</span>
+                    </button>
+                    <button class="voice-lang-btn" data-lang="te-IN" onclick="selectVoiceLanguage('te-IN')">
+                        <i class="fas fa-language"></i><span>తెలుగు</span>
+                    </button>
+                </div>
+            </div>
+
+            <div id="voice-flow" class="hidden">
+                <div class="voice-mic-visual">
+                    <div id="voice-mic-pulse" class="voice-mic-pulse"></div>
+                    <div id="voice-mic-circle" class="voice-mic-circle">
+                        <i class="fas fa-microphone"></i>
+                    </div>
+                </div>
+                <p id="voice-status" class="voice-status">Tap the mic to begin</p>
+                <p id="voice-transcript" class="voice-transcript"></p>
+
+                <div id="voice-summary" class="voice-summary hidden">
+                    <div class="voice-summary-row"><span>Name</span><b id="vs-name">--</b></div>
+                    <div class="voice-summary-row"><span>Ward</span><b id="vs-ward">--</b></div>
+                    <div class="voice-summary-row"><span>Category</span><b id="vs-category">--</b></div>
+                    <div class="voice-summary-row"><span>Urgency</span><b id="vs-urgency">--</b></div>
+                    <div class="voice-summary-row voice-summary-desc"><span>Details</span><b id="vs-desc">--</b></div>
+                </div>
+
+                <div class="voice-controls">
+                    <button id="voice-mic-btn" class="voice-btn-primary" onclick="voiceMicTap()">
+                        <i class="fas fa-microphone mr-2"></i><span id="voice-mic-btn-label">Start</span>
+                    </button>
+                    <button id="voice-restart-btn" class="voice-btn-secondary hidden" onclick="restartVoiceFlow()">
+                        <i class="fas fa-rotate-left mr-2"></i>Start Over
+                    </button>
+                </div>
+                <button class="voice-link-btn" onclick="backToLanguagePicker()"><i class="fas fa-arrow-left mr-1"></i>Change language</button>
+            </div>
+
+            <div id="voice-unsupported" class="hidden">
+                <i class="fas fa-triangle-exclamation text-4xl text-accent mb-3"></i>
+                <p class="voice-status">Voice input isn't supported in this browser.<br>Please try Google Chrome.</p>
+            </div>
+        </div>
+    </div>
+
     </div><!-- /#app-content -->
 
     <script src="script.js"></script>

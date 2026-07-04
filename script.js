@@ -749,23 +749,54 @@ function handleGoogleCredentialResponse(response) {
     });
 }
 
-function initGoogleSignIn() {
-    if (!window.google || !window.google.accounts || GOOGLE_CLIENT_ID.startsWith('YOUR_')) {
-        // No real client ID configured — show a disabled-look demo button instead of failing silently
-        const wrap = document.getElementById('google-signin-btn');
-        wrap.innerHTML = `
-            <button type="button" class="auth-btn-primary" style="background:#1A2A2A;color:#6B8A8A;cursor:not-allowed" title="Add your Google Client ID in script.js to enable this">
-                <i class="fab fa-google mr-2"></i>Continue with Google
-            </button>`;
+function showDisabledGoogleButton(reasonTitle) {
+    const wrap = document.getElementById('google-signin-btn');
+    wrap.innerHTML = `
+        <button type="button" class="auth-btn-primary" style="background:#1A2A2A;color:#6B8A8A;cursor:not-allowed" title="${reasonTitle}">
+            <i class="fab fa-google mr-2"></i>Continue with Google
+        </button>`;
+}
+
+function initGoogleSignIn(retriesLeft = 20) {
+    // 1) You must run this over http(s):// — Google Identity Services refuses to work
+    //    when the page is opened directly as a file:// URL. Serve it, e.g.:
+    //      python3 -m http.server 8000    then open http://localhost:8000
+    if (location.protocol === 'file:') {
+        showDisabledGoogleButton('Google Sign-In needs the page served over http/https, not opened as a local file. Run a local server (e.g. "python3 -m http.server") and open it via http://localhost.');
         return;
     }
-    google.accounts.id.initialize({
-        client_id: GOOGLE_CLIENT_ID,
-        callback: handleGoogleCredentialResponse
-    });
-    google.accounts.id.renderButton(document.getElementById('google-signin-btn'), {
-        theme: 'filled_black', size: 'large', shape: 'pill', width: 320
-    });
+
+    if (GOOGLE_CLIENT_ID.startsWith('YOUR_')) {
+        showDisabledGoogleButton('Add your real Google Client ID at the top of script.js to enable this.');
+        return;
+    }
+
+    // 2) The GSI script tag loads with async/defer, so on a slow connection
+    //    window.google might not exist yet when this function first runs.
+    //    Poll briefly instead of giving up immediately.
+    if (!window.google || !window.google.accounts) {
+        if (retriesLeft > 0) {
+            setTimeout(() => initGoogleSignIn(retriesLeft - 1), 250);
+        } else {
+            showDisabledGoogleButton('Google Sign-In script failed to load. Check your internet connection and that accounts.google.com is not blocked.');
+        }
+        return;
+    }
+
+    try {
+        google.accounts.id.initialize({
+            client_id: GOOGLE_CLIENT_ID,
+            callback: handleGoogleCredentialResponse
+        });
+        google.accounts.id.renderButton(document.getElementById('google-signin-btn'), {
+            theme: 'filled_black', size: 'large', shape: 'pill', width: 320
+        });
+        // Optional: also show the "One Tap" prompt automatically
+        // google.accounts.id.prompt();
+    } catch (err) {
+        console.error('Google Sign-In init failed:', err);
+        showDisabledGoogleButton('Google Sign-In failed to initialize — check the browser console for details. This usually means the Client ID is wrong or the current URL is not in "Authorized JavaScript origins" in Google Cloud Console.');
+    }
 }
 
 // ----- Email / Password (mock) -----
@@ -936,6 +967,438 @@ function initAuth() {
 
     // App starts locked/logged-out
     document.getElementById('app-content').classList.add('locked');
+}
+
+// =========================================================================
+// VOICE ASSIST — for citizens who can't read/write or aren't comfortable
+// with forms. Speaks each question aloud (text-to-speech) and listens for
+// the spoken answer (speech-to-text), then confirms out loud once saved.
+// Works in Chrome / Edge / most Android browsers. Needs a real Client ID
+// for nothing — this uses the browser's built-in Web Speech API, no setup.
+// =========================================================================
+
+const VOICE_STRINGS = {
+    'en-IN': {
+        pickLanguage: 'Choose your language',
+        askName: 'Please say your full name after the beep.',
+        askWard: 'Which ward do you live in? Please say the ward number, for example, ward three.',
+        askCategory: 'What is the problem about? You can say things like water, road, electricity, health, school, safety, job, garbage, bus, or park.',
+        askDesc: 'Please describe the problem in a few sentences.',
+        askUrgency: 'How serious is this problem? Say low, medium, high, or critical.',
+        confirmPrefix: 'Here is what I heard.',
+        confirmAsk: 'Say yes to save this, or no to start over.',
+        savedSpeech: 'Thank you. Your problem has been recorded and saved successfully.',
+        cancelledSpeech: 'Okay, let us start again.',
+        notUnderstoodWard: "Sorry, I didn't understand the ward number. Please say it again, like ward three.",
+        notUnderstoodCategory: "Sorry, I didn't understand the category. Please try again with a simple word like water, road, or health.",
+        notUnderstoodUrgency: "Sorry, please say only low, medium, high, or critical.",
+        notUnderstoodYesNo: "Please say yes or no.",
+        listening: 'Listening...',
+        tapToBegin: 'Tap the mic to begin',
+        micDenied: 'Microphone access was blocked. Please allow microphone access and try again.',
+        needMoreWords: "I didn't catch that clearly. Please try again.",
+        labels: { name:'Name', ward:'Ward', category:'Category', urgency:'Urgency', desc:'Details' },
+        yes: ['yes','yeah','yep','correct','ok','okay','sure'],
+        no: ['no','nope','wrong','cancel'],
+        numberWords: {one:1,two:2,three:3,four:4,five:5,six:6,seven:7,eight:8},
+        categoryKeywords: {
+            'Water Supply': ['water','tap','pipeline','borewell'],
+            'Infrastructure': ['road','street','pothole','bridge','drainage','building'],
+            'Healthcare': ['health','hospital','doctor','medicine','clinic'],
+            'Education': ['school','teacher','education','college'],
+            'Safety': ['police','safety','theft','crime','danger','safe'],
+            'Employment': ['job','employment','work','jobless'],
+            'Sanitation': ['garbage','trash','sanitation','dirty','waste','sewage'],
+            'Electricity': ['electricity','current','power','light','transformer'],
+            'Public Transport': ['bus','transport','auto'],
+            'Parks': ['park','garden']
+        },
+        urgencyKeywords: {
+            low: ['low','small','minor'],
+            medium: ['medium','normal','moderate'],
+            high: ['high','serious','urgent'],
+            critical: ['critical','emergency','very serious','severe']
+        }
+    },
+    'hi-IN': {
+        askName: 'बीप के बाद कृपया अपना पूरा नाम बताएं।',
+        askWard: 'आप किस वार्ड में रहते हैं? कृपया वार्ड नंबर बताएं, जैसे वार्ड तीन।',
+        askCategory: 'समस्या किस बारे में है? आप पानी, सड़क, बिजली, स्वास्थ्य, स्कूल, सुरक्षा, नौकरी, कचरा, बस, या पार्क जैसे शब्द बोल सकते हैं।',
+        askDesc: 'कृपया समस्या के बारे में कुछ वाक्यों में बताएं।',
+        askUrgency: 'यह समस्या कितनी गंभीर है? कम, सामान्य, गंभीर, या अत्यंत गंभीर बोलें।',
+        confirmPrefix: 'मैंने यह सुना है।',
+        confirmAsk: 'सहेजने के लिए हाँ बोलें, या फिर से शुरू करने के लिए नहीं बोलें।',
+        savedSpeech: 'धन्यवाद। आपकी समस्या सफलतापूर्वक दर्ज कर ली गई है।',
+        cancelledSpeech: 'ठीक है, फिर से शुरू करते हैं।',
+        notUnderstoodWard: 'माफ़ कीजिए, वार्ड नंबर समझ नहीं आया। कृपया फिर से बताएं, जैसे वार्ड तीन।',
+        notUnderstoodCategory: 'माफ़ कीजिए, समझ नहीं आया। कृपया पानी, सड़क, या स्वास्थ्य जैसे आसान शब्द से बताएं।',
+        notUnderstoodUrgency: 'कृपया केवल कम, सामान्य, गंभीर, या अत्यंत गंभीर बोलें।',
+        notUnderstoodYesNo: 'कृपया हाँ या नहीं बोलें।',
+        listening: 'सुन रहा हूँ...',
+        tapToBegin: 'शुरू करने के लिए माइक दबाएं',
+        micDenied: 'माइक्रोफ़ोन की अनुमति नहीं मिली। कृपया अनुमति दें और फिर से प्रयास करें।',
+        needMoreWords: 'मुझे ठीक से समझ नहीं आया। कृपया फिर से बोलें।',
+        labels: { name:'नाम', ward:'वार्ड', category:'श्रेणी', urgency:'गंभीरता', desc:'विवरण' },
+        yes: ['हाँ','जी हाँ','ठीक है'],
+        no: ['नहीं','ना'],
+        numberWords: {'एक':1,'दो':2,'तीन':3,'चार':4,'पांच':5,'छह':6,'सात':7,'आठ':8},
+        categoryKeywords: {
+            'Water Supply': ['पानी','नल','पाइपलाइन'],
+            'Infrastructure': ['सड़क','रोड','गड्ढा','पुल','नाली'],
+            'Healthcare': ['स्वास्थ्य','अस्पताल','डॉक्टर','दवा'],
+            'Education': ['स्कूल','शिक्षा','टीचर'],
+            'Safety': ['पुलिस','सुरक्षा','चोरी','अपराध'],
+            'Employment': ['नौकरी','काम','रोजगार'],
+            'Sanitation': ['कचरा','गंदगी','सफाई'],
+            'Electricity': ['बिजली','करंट','ट्रांसफार्मर'],
+            'Public Transport': ['बस','परिवहन'],
+            'Parks': ['पार्क','बगीचा']
+        },
+        urgencyKeywords: {
+            low: ['कम'],
+            medium: ['सामान्य','मध्यम'],
+            high: ['गंभीर','ज़रूरी'],
+            critical: ['अत्यंत गंभीर','आपातकाल','बहुत गंभीर']
+        }
+    },
+    'te-IN': {
+        askName: 'బీప్ తర్వాత దయచేసి మీ పూర్తి పేరు చెప్పండి.',
+        askWard: 'మీరు ఏ వార్డులో నివసిస్తున్నారు? దయచేసి వార్డు నంబర్ చెప్పండి, ఉదాహరణకు వార్డు మూడు.',
+        askCategory: 'సమస్య దేని గురించి? నీరు, రోడ్డు, కరెంట్, ఆరోగ్యం, స్కూల్, భద్రత, ఉద్యోగం, చెత్త, బస్సు, లేదా పార్క్ వంటి పదాలు చెప్పవచ్చు.',
+        askDesc: 'దయచేసి సమస్యను కొన్ని వాక్యాలలో వివరించండి.',
+        askUrgency: 'ఈ సమస్య ఎంత తీవ్రమైనది? తక్కువ, మధ్యస్థ, తీవ్రమైన, లేదా చాలా తీవ్రమైనది అని చెప్పండి.',
+        confirmPrefix: 'నేను ఇది విన్నాను.',
+        confirmAsk: 'సేవ్ చేయడానికి అవును చెప్పండి, లేదా మళ్ళీ మొదలుపెట్టడానికి కాదు చెప్పండి.',
+        savedSpeech: 'ధన్యవాదాలు. మీ సమస్య విజయవంతంగా నమోదు చేయబడింది.',
+        cancelledSpeech: 'సరే, మళ్ళీ మొదలుపెడదాం.',
+        notUnderstoodWard: 'క్షమించండి, వార్డు నంబర్ అర్థం కాలేదు. దయచేసి మళ్ళీ చెప్పండి, వార్డు మూడు లాగా.',
+        notUnderstoodCategory: 'క్షమించండి, అర్థం కాలేదు. దయచేసి నీరు, రోడ్డు, లేదా ఆరోగ్యం వంటి సులభమైన పదంతో చెప్పండి.',
+        notUnderstoodUrgency: 'దయచేసి తక్కువ, మధ్యస్థ, తీవ్రమైన, లేదా చాలా తీవ్రమైనది అని మాత్రమే చెప్పండి.',
+        notUnderstoodYesNo: 'దయచేసి అవును లేదా కాదు చెప్పండి.',
+        listening: 'వింటున్నాను...',
+        tapToBegin: 'ప్రారంభించడానికి మైక్ నొక్కండి',
+        micDenied: 'మైక్రోఫోన్ అనుమతి లభించలేదు. దయచేసి అనుమతి ఇచ్చి మళ్ళీ ప్రయత్నించండి.',
+        needMoreWords: 'నాకు సరిగ్గా అర్థం కాలేదు. దయచేసి మళ్ళీ చెప్పండి.',
+        labels: { name:'పేరు', ward:'వార్డు', category:'వర్గం', urgency:'తీవ్రత', desc:'వివరాలు' },
+        yes: ['అవును'],
+        no: ['కాదు'],
+        numberWords: {'ఒకటి':1,'రెండు':2,'మూడు':3,'నాలుగు':4,'ఐదు':5,'ఆరు':6,'ఏడు':7,'ఎనిమిది':8},
+        categoryKeywords: {
+            'Water Supply': ['నీరు','నీటి','కొళాయి'],
+            'Infrastructure': ['రోడ్డు','రహదారి','వంతెన','డ్రైనేజీ'],
+            'Healthcare': ['ఆరోగ్యం','ఆసుపత్రి','డాక్టర్','మందు'],
+            'Education': ['స్కూల్','పాఠశాల','ఉపాధ్యాయుడు'],
+            'Safety': ['పోలీసు','భద్రత','దొంగతనం','నేరం'],
+            'Employment': ['ఉద్యోగం','పని'],
+            'Sanitation': ['చెత్త','పరిశుభ్రత','మురుగు'],
+            'Electricity': ['కరెంట్','విద్యుత్','ట్రాన్స్ఫార్మర్'],
+            'Public Transport': ['బస్సు','రవాణా'],
+            'Parks': ['పార్క్','ఉద్యానవనం']
+        },
+        urgencyKeywords: {
+            low: ['తక్కువ'],
+            medium: ['మధ్యస్థ'],
+            high: ['తీవ్రమైన'],
+            critical: ['చాలా తీవ్రమైనది','అత్యవసరం']
+        }
+    }
+};
+
+let voiceLang = 'en-IN';
+let voiceRecognition = null;
+let voiceListening = false;
+let voiceData = { name:'', ward:'', wardRaw:'', category:'', urgency:'', desc:'' };
+let voiceFlowActive = false;
+
+function speechSupported() {
+    return !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+}
+
+function speak(text, lang) {
+    return new Promise(resolve => {
+        if (!window.speechSynthesis) { resolve(); return; }
+        window.speechSynthesis.cancel();
+        const utter = new SpeechSynthesisUtterance(text);
+        utter.lang = lang || voiceLang;
+        utter.rate = 0.95;
+        utter.onend = resolve;
+        utter.onerror = resolve;
+        window.speechSynthesis.speak(utter);
+    });
+}
+
+// Listens once and resolves with the recognized transcript (lowercased for
+// English; kept as-is for Hindi/Telugu since they use different scripts).
+function listenOnce() {
+    return new Promise((resolve, reject) => {
+        const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SR) { reject(new Error('unsupported')); return; }
+
+        const recognition = new SR();
+        voiceRecognition = recognition;
+        recognition.lang = voiceLang;
+        recognition.interimResults = true;
+        recognition.maxAlternatives = 1;
+        recognition.continuous = false;
+
+        let finalTranscript = '';
+        setVoiceListeningUI(true);
+
+        recognition.onresult = (event) => {
+            let interim = '';
+            for (let i = event.resultIndex; i < event.results.length; i++) {
+                const transcript = event.results[i][0].transcript;
+                if (event.results[i].isFinal) finalTranscript += transcript;
+                else interim += transcript;
+            }
+            document.getElementById('voice-transcript').textContent = finalTranscript || interim;
+        };
+        recognition.onerror = (event) => {
+            setVoiceListeningUI(false);
+            if (event.error === 'not-allowed' || event.error === 'permission-denied') {
+                reject(new Error('denied'));
+            } else if (event.error === 'no-speech') {
+                reject(new Error('no-speech'));
+            } else {
+                reject(new Error(event.error || 'unknown'));
+            }
+        };
+        recognition.onend = () => {
+            setVoiceListeningUI(false);
+            resolve(finalTranscript.trim());
+        };
+        try {
+            recognition.start();
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+function setVoiceListeningUI(isListening) {
+    voiceListening = isListening;
+    const circle = document.getElementById('voice-mic-circle');
+    const pulse = document.getElementById('voice-mic-pulse');
+    const status = document.getElementById('voice-status');
+    if (!circle) return;
+    circle.classList.toggle('listening', isListening);
+    pulse.classList.toggle('active', isListening);
+    if (isListening) status.textContent = VOICE_STRINGS[voiceLang].listening || 'Listening...';
+}
+
+function matchNumberFromSpeech(text, lang) {
+    const digitMatch = text.match(/\d+/);
+    if (digitMatch) return parseInt(digitMatch[0], 10);
+    const words = VOICE_STRINGS[lang].numberWords;
+    for (const w in words) {
+        if (text.includes(w)) return words[w];
+    }
+    return null;
+}
+
+function matchCategoryFromSpeech(text, lang) {
+    const map = VOICE_STRINGS[lang].categoryKeywords;
+    for (const category in map) {
+        if (map[category].some(kw => text.includes(kw))) return category;
+    }
+    return null;
+}
+
+function matchUrgencyFromSpeech(text, lang) {
+    const map = VOICE_STRINGS[lang].urgencyKeywords;
+    for (const level in map) {
+        if (map[level].some(kw => text.includes(kw))) return level;
+    }
+    return null;
+}
+
+function matchYesNoFromSpeech(text, lang) {
+    const strings = VOICE_STRINGS[lang];
+    if (strings.yes.some(w => text.includes(w))) return true;
+    if (strings.no.some(w => text.includes(w))) return false;
+    return null;
+}
+
+// ----- Modal open/close -----
+function openVoiceAssist() {
+    if (!currentUser) { showToast('Please sign in first', 'error'); return; }
+    document.getElementById('voice-modal-overlay').classList.add('active');
+    if (!speechSupported()) {
+        document.getElementById('voice-lang-picker').classList.add('hidden');
+        document.getElementById('voice-flow').classList.add('hidden');
+        document.getElementById('voice-unsupported').classList.remove('hidden');
+        return;
+    }
+    document.getElementById('voice-unsupported').classList.add('hidden');
+    backToLanguagePicker();
+}
+
+function closeVoiceAssist() {
+    if (voiceRecognition) { try { voiceRecognition.abort(); } catch(e) {} }
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    voiceFlowActive = false;
+    document.getElementById('voice-modal-overlay').classList.remove('active');
+}
+
+function backToLanguagePicker() {
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    document.getElementById('voice-lang-picker').classList.remove('hidden');
+    document.getElementById('voice-flow').classList.add('hidden');
+}
+
+function selectVoiceLanguage(lang) {
+    voiceLang = lang;
+    document.getElementById('voice-lang-picker').classList.add('hidden');
+    document.getElementById('voice-flow').classList.remove('hidden');
+    resetVoiceFlowUI();
+}
+
+function resetVoiceFlowUI() {
+    voiceData = { name:'', ward:'', wardRaw:'', category:'', urgency:'', desc:'' };
+    document.getElementById('voice-status').textContent = VOICE_STRINGS[voiceLang].tapToBegin;
+    document.getElementById('voice-transcript').textContent = '';
+    document.getElementById('voice-summary').classList.add('hidden');
+    document.getElementById('voice-mic-btn').classList.remove('hidden');
+    document.getElementById('voice-mic-btn-label').textContent = 'Start';
+    document.getElementById('voice-restart-btn').classList.add('hidden');
+}
+
+function restartVoiceFlow() {
+    resetVoiceFlowUI();
+}
+
+function voiceMicTap() {
+    if (voiceFlowActive) return; // already running
+    runVoiceFlow();
+}
+
+// Wraps listenOnce with basic retry-on-failure messaging.
+async function listenWithRetry(promptFn, validateFn, maxTries = 3) {
+    for (let attempt = 0; attempt < maxTries; attempt++) {
+        try {
+            const transcript = await listenOnce();
+            const lower = voiceLang === 'en-IN' ? transcript.toLowerCase() : transcript;
+            if (!lower) {
+                await speak(VOICE_STRINGS[voiceLang].needMoreWords);
+                continue;
+            }
+            const result = validateFn(lower, transcript);
+            if (result !== null && result !== undefined && result !== false) return result;
+            await speak(promptFn());
+        } catch (err) {
+            if (err.message === 'denied') {
+                await speak(VOICE_STRINGS[voiceLang].micDenied);
+                throw err;
+            }
+            // no-speech or other transient errors — just re-prompt
+            await speak(VOICE_STRINGS[voiceLang].needMoreWords);
+        }
+    }
+    return null;
+}
+
+async function runVoiceFlow() {
+    const S = VOICE_STRINGS[voiceLang];
+    voiceFlowActive = true;
+    document.getElementById('voice-summary').classList.add('hidden');
+    document.getElementById('voice-restart-btn').classList.add('hidden');
+    document.getElementById('voice-mic-btn').classList.add('hidden');
+
+    try {
+        // 1) Name
+        document.getElementById('voice-status').textContent = S.askName;
+        await speak(S.askName);
+        const nameRaw = await listenWithRetry(() => S.askName, t => t.length > 1 ? t : null);
+        if (!nameRaw) throw new Error('abandoned');
+        voiceData.name = nameRaw.replace(/\b\w/g, c => c.toUpperCase());
+
+        // 2) Ward
+        document.getElementById('voice-status').textContent = S.askWard;
+        await speak(S.askWard);
+        const wardNum = await listenWithRetry(() => S.notUnderstoodWard, t => matchNumberFromSpeech(t, voiceLang));
+        if (!wardNum) throw new Error('abandoned');
+        voiceData.ward = `Ward ${wardNum}`;
+
+        // 3) Category
+        document.getElementById('voice-status').textContent = S.askCategory;
+        await speak(S.askCategory);
+        const category = await listenWithRetry(() => S.notUnderstoodCategory, t => matchCategoryFromSpeech(t, voiceLang));
+        if (!category) throw new Error('abandoned');
+        voiceData.category = category;
+
+        // 4) Description
+        document.getElementById('voice-status').textContent = S.askDesc;
+        await speak(S.askDesc);
+        const desc = await listenWithRetry(() => S.askDesc, t => t.length > 5 ? t : null);
+        if (!desc) throw new Error('abandoned');
+        voiceData.desc = desc;
+
+        // 5) Urgency
+        document.getElementById('voice-status').textContent = S.askUrgency;
+        await speak(S.askUrgency);
+        const urgency = await listenWithRetry(() => S.notUnderstoodUrgency, t => matchUrgencyFromSpeech(t, voiceLang));
+        if (!urgency) throw new Error('abandoned');
+        voiceData.urgency = urgency;
+
+        // 6) Confirm
+        showVoiceSummary();
+        const confirmText = `${S.confirmPrefix} ${S.confirmAsk}`;
+        document.getElementById('voice-status').textContent = S.confirmAsk;
+        await speak(confirmText);
+        const confirmed = await listenWithRetry(() => S.notUnderstoodYesNo, t => {
+            const yn = matchYesNoFromSpeech(t, voiceLang);
+            return yn === true ? true : (yn === false ? 'no' : null);
+        });
+
+        if (confirmed === true) {
+            saveVoiceSubmission();
+            document.getElementById('voice-status').textContent = S.savedSpeech;
+            await speak(S.savedSpeech);
+            setTimeout(closeVoiceAssist, 1800);
+        } else {
+            await speak(S.cancelledSpeech);
+            resetVoiceFlowUI();
+        }
+    } catch (err) {
+        if (err.message !== 'abandoned' && err.message !== 'denied') {
+            console.error('Voice flow error:', err);
+        }
+        resetVoiceFlowUI();
+    } finally {
+        voiceFlowActive = false;
+    }
+}
+
+function showVoiceSummary() {
+    const S = VOICE_STRINGS[voiceLang];
+    document.getElementById('vs-name').textContent = voiceData.name;
+    document.getElementById('vs-ward').textContent = voiceData.ward;
+    document.getElementById('vs-category').textContent = voiceData.category;
+    document.getElementById('vs-urgency').textContent = voiceData.urgency;
+    document.getElementById('vs-desc').textContent = voiceData.desc;
+    document.getElementById('voice-summary').classList.remove('hidden');
+}
+
+function saveVoiceSubmission() {
+    submissions.push({
+        id: nextId++,
+        name: voiceData.name,
+        category: voiceData.category,
+        description: voiceData.desc,
+        urgency: voiceData.urgency,
+        ward: voiceData.ward,
+        timestamp: new Date()
+    });
+    updateStats();
+    renderLiveFeed();
+    showToast('Priority submitted via Voice Assist!', 'success');
+    if (dashboardVisible) {
+        rankedPriorities = analyzePriorities();
+        renderRankedCards(rankedPriorities);
+        renderCharts(rankedPriorities);
+        renderUrgencyBars();
+        renderActionPlan(rankedPriorities);
+    }
 }
 
 // ===== INITIALIZATION =====
