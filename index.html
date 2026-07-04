@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>People's Priorities — AI-Powered Civic Governance</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <!-- Google Identity Services (for Google Sign-In) -->
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: { heading: ['"Space Grotesk"','sans-serif'], body: ['"DM Sans"','sans-serif'] },
+                    colors: {
+                        bg: '#070C0C', card: '#0E1616', 'card-hover': '#142020',
+                        fg: '#E2EBEB', muted: '#6B8A8A', accent: '#F59E0B',
+                        'accent-hover': '#D97706', primary: '#0D9488', 'primary-light': '#14B8A6',
+                        brd: '#1A2A2A', danger: '#EF4444', success: '#10B981',
+                    }
+                }
+            }
+        }
+    </script>
+</head>
+<body>
+    <!-- Toast Container -->
+    <div id="toast-container" aria-live="polite"></div>
+
+    <!-- ============================================================
+         AUTH OVERLAY — shown until the user signs in
+         ============================================================ -->
+    <div id="auth-overlay">
+        <div class="auth-card">
+            <div class="text-center mb-6">
+                <div class="w-12 h-12 rounded-xl bg-accent/20 flex items-center justify-center mx-auto mb-3">
+                    <i class="fas fa-bullseye text-accent"></i>
+                </div>
+                <h2 class="font-heading text-xl font-bold" id="auth-title">Welcome Back</h2>
+                <p class="text-muted text-sm mt-1" id="auth-subtitle">Sign in to submit and view civic priorities</p>
+            </div>
+
+            <div class="auth-tabs">
+                <button type="button" class="auth-tab-btn active" data-method="email">Email</button>
+                <button type="button" class="auth-tab-btn" data-method="phone">Phone</button>
+            </div>
+
+            <!-- Google Sign-In (always visible) -->
+            <div class="google-btn-wrap mb-2">
+                <div id="google-signin-btn"></div>
+            </div>
+            <p class="text-[11px] text-muted text-center mb-2">
+                Google Sign-In needs a Client ID — see <code>script.js</code> (GOOGLE_CLIENT_ID) to enable it.
+            </p>
+
+            <div class="auth-divider">or continue with</div>
+
+            <!-- EMAIL PANEL -->
+            <div class="auth-panel active" id="panel-email">
+                <form id="email-auth-form" class="space-y-3" novalidate>
+                    <div>
+                        <input type="email" id="auth-email" class="form-input" placeholder="Email address" required>
+                    </div>
+                    <div>
+                        <input type="password" id="auth-password" class="form-input" placeholder="Password" minlength="6" required>
+                    </div>
+                    <div id="signup-name-wrap" class="hidden">
+                        <input type="text" id="auth-name" class="form-input" placeholder="Full name">
+                    </div>
+                    <p class="auth-error" id="email-auth-error"></p>
+                    <button type="submit" class="auth-btn-primary" id="email-auth-submit">Sign In</button>
+                </form>
+                <p class="text-center text-sm text-muted mt-4">
+                    <span id="email-auth-toggle-text">Don't have an account?</span>
+                    <button type="button" class="auth-link-btn" id="email-auth-toggle">Sign Up</button>
+                </p>
+            </div>
+
+            <!-- PHONE PANEL -->
+            <div class="auth-panel" id="panel-phone">
+                <div id="phone-step-number">
+                    <div class="flex gap-2">
+                        <input type="text" class="form-input" value="+91" style="max-width:70px" id="phone-code">
+                        <input type="tel" id="auth-phone" class="form-input" placeholder="10-digit phone number">
+                    </div>
+                    <p class="auth-error" id="phone-number-error"></p>
+                    <button type="button" class="auth-btn-primary mt-3" id="btn-send-otp">Send OTP</button>
+                </div>
+                <div id="phone-step-otp" class="hidden">
+                    <p class="text-sm text-muted mb-3 text-center">Enter the 6-digit code sent to <span id="otp-phone-display" class="text-fg font-medium"></span></p>
+                    <div class="otp-inputs">
+                        <input maxlength="1" inputmode="numeric">
+                        <input maxlength="1" inputmode="numeric">
+                        <input maxlength="1" inputmode="numeric">
+                        <input maxlength="1" inputmode="numeric">
+                        <input maxlength="1" inputmode="numeric">
+                        <input maxlength="1" inputmode="numeric">
+                    </div>
+                    <p class="demo-otp-note" id="demo-otp-note">Demo mode: no SMS gateway connected, so your code is shown here for testing: <strong id="demo-otp-code">------</strong></p>
+                    <p class="auth-error" id="otp-error"></p>
+                    <button type="button" class="auth-btn-primary" id="btn-verify-otp">Verify & Continue</button>
+                    <p class="text-center text-sm text-muted mt-3">
+                        <button type="button" class="auth-link-btn" id="btn-change-number">Change number</button>
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- AI Processing Overlay -->
+    <div id="ai-overlay" role="dialog" aria-label="AI analysis in progress">
+        <canvas id="ai-canvas"></canvas>
+    </div>
+
+    <!-- ============================================================
+         MAIN APP CONTENT — blurred/locked until signed in
+         ============================================================ -->
+    <div id="app-content" class="locked">
+
+    <!-- Navigation -->
+    <nav id="navbar" class="fixed top-0 left-0 right-0 z-50 px-6 py-4">
+        <div class="max-w-7xl mx-auto flex items-center justify-between">
+            <a href="#hero" class="flex items-center gap-3 group">
+                <div class="w-9 h-9 rounded-lg bg-accent/20 flex items-center justify-center">
+                    <i class="fas fa-bullseye text-accent text-sm"></i>
+                </div>
+                <span class="font-heading font-bold text-lg text-fg group-hover:text-accent transition-colors">People's Priorities</span>
+            </a>
+            <div class="hidden md:flex items-center gap-8">
+                <a href="#hero" class="text-sm text-muted hover:text-fg transition-colors">Overview</a>
+                <a href="#submit-section" class="text-sm text-muted hover:text-fg transition-colors">Submit</a>
+                <a href="#analyze-section" class="text-sm text-muted hover:text-fg transition-colors">Analyze</a>
+                <a href="#dashboard" class="text-sm text-muted hover:text-fg transition-colors">Dashboard</a>
+            </div>
+            <div class="flex items-center gap-3">
+                <button onclick="document.getElementById('submit-section').scrollIntoView({behavior:'smooth'})" class="px-5 py-2.5 bg-accent hover:bg-accent-hover text-bg font-heading font-semibold text-sm rounded-lg transition-colors">
+                    Submit Priority
+                </button>
+                <div class="relative">
+                    <div class="user-badge" id="user-badge" onclick="toggleUserMenu()">
+                        <span id="user-avatar-slot"></span>
+                        <span class="text-sm font-medium" id="user-name-slot">Guest</span>
+                        <i class="fas fa-chevron-down text-xs text-muted"></i>
+                    </div>
+                    <div id="user-menu" class="hidden absolute right-0 mt-2 w-44 bg-card border border-brd rounded-xl shadow-xl overflow-hidden">
+                        <button onclick="logout()" class="w-full text-left px-4 py-3 text-sm text-danger hover:bg-brd transition-colors">
+                            <i class="fas fa-right-from-bracket mr-2"></i>Log out
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Hero Section -->
+    <section id="hero" class="relative min-h-screen flex items-center justify-center hero-grid overflow-hidden">
+        <div class="orb orb-1"></div>
+        <div class="orb orb-2"></div>
+        <div class="orb orb-3"></div>
+        <div class="relative z-10 text-center px-6 max-w-4xl mx-auto">
+            <div class="inline-flex items-center gap-2 px-4 py-2 rounded-full border border-brd bg-card/60 backdrop-blur-sm mb-8">
+                <span class="w-2 h-2 rounded-full bg-success animate-pulse"></span>
+                <span class="text-xs font-medium text-muted">Status</span>
+            </div>
+            <h1 class="font-heading text-5xl sm:text-6xl lg:text-7xl font-bold leading-[1.08] mb-6">
+                Turn Citizen Voices<br>
+                <span class="text-accent">Into Action</span>
+            </h1>
+            <p class="text-lg sm:text-xl text-muted max-w-2xl mx-auto mb-10 leading-relaxed">
+                Citizens submit their problems. AI clusters, ranks, and prioritizes them.
+                Output: a clear, actionable development plan for your constituency.
+            </p>
+            <div class="flex flex-col sm:flex-row items-center justify-center gap-4">
+                <button onclick="document.getElementById('submit-section').scrollIntoView({behavior:'smooth'})" class="px-8 py-4 bg-accent hover:bg-accent-hover text-bg font-heading font-bold text-base rounded-xl transition-all hover:scale-105 active:scale-95">
+                    <i class="fas fa-paper-plane mr-2"></i>Submit a Priority
+                </button>
+                <button onclick="document.getElementById('analyze-section').scrollIntoView({behavior:'smooth'})" class="px-8 py-4 border border-brd hover:border-primary/50 text-fg font-heading font-semibold text-base rounded-xl transition-all hover:bg-card">
+                    <i class="fas fa-chart-bar mr-2 text-primary"></i>View Dashboard
+                </button>
+            </div>
+            <div class="mt-16 flex items-center justify-center gap-12 text-sm text-muted">
+                <div class="flex items-center gap-2"><i class="fas fa-users text-primary"></i> Citizen Submissions</div>
+                <div class="flex items-center gap-2"><i class="fas fa-brain text-accent"></i> AI Clustering</div>
+                <div class="flex items-center gap-2"><i class="fas fa-clipboard-list text-success"></i> Action Plans</div>
+            </div>
+        </div>
+        <div class="absolute bottom-8 left-1/2 -translate-x-1/2 animate-bounce">
+            <i class="fas fa-chevron-down text-muted/50 text-lg"></i>
+        </div>
+    </section>
+
+    <!-- Stats Section -->
+    <section id="stats" class="py-8 border-y border-brd bg-card/30">
+        <div class="max-w-7xl mx-auto px-6 grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div class="stat-card text-center p-5">
+                <div class="text-3xl font-heading font-bold text-accent" id="stat-total">0</div>
+                <div class="text-xs text-muted mt-1 uppercase tracking-wider">Total Submissions</div>
+            </div>
+            <div class="stat-card text-center p-5" style="transition-delay:0.1s">
+                <div class="text-3xl font-heading font-bold text-primary" id="stat-categories">0</div>
+                <div class="text-xs text-muted mt-1 uppercase tracking-wider">Categories</div>
+            </div>
+            <div class="stat-card text-center p-5" style="transition-delay:0.2s">
+                <div class="text-3xl font-heading font-bold text-success" id="stat-wards">0</div>
+                <div class="text-xs text-muted mt-1 uppercase tracking-wider">Wards Covered</div>
+            </div>
+            <div class="stat-card text-center p-5" style="transition-delay:0.3s">
+                <div class="text-3xl font-heading font-bold text-danger" id="stat-critical">0</div>
+                <div class="text-xs text-muted mt-1 uppercase tracking-wider">Critical Issues</div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Submit & Live Feed Section -->
+    <section id="submit-section" class="py-20 px-6">
+        <div class="max-w-7xl mx-auto">
+            <div class="text-center mb-14">
+                <h2 class="font-heading text-3xl sm:text-4xl font-bold mb-4">Submit Your Priority</h2>
+                <p class="text-muted max-w-lg mx-auto">Tell us what matters most to you. Your submission will be analyzed by AI along with all other citizen inputs.</p>
+            </div>
+            <div class="grid lg:grid-cols-5 gap-8">
+                <!-- Form -->
+                <div class="lg:col-span-3 bg-card border border-brd rounded-2xl p-8">
+                    <form id="priority-form" class="space-y-5" novalidate>
+                        <div class="grid sm:grid-cols-2 gap-5">
+                            <div>
+                                <label class="block text-sm font-medium text-muted mb-2">Your Name</label>
+                                <input type="text" id="f-name" class="form-input" placeholder="e.g. Rajesh Kumar" required>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-muted mb-2">Ward</label>
+                                <select id="f-ward" class="form-input" required>
+                                    <option value="">Select ward...</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="grid sm:grid-cols-2 gap-5">
+                            <div>
+                                <label class="block text-sm font-medium text-muted mb-2">Category</label>
+                                <select id="f-category" class="form-input" required>
+                                    <option value="">Select category...</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-muted mb-2">Urgency Level</label>
+                                <div class="flex flex-wrap gap-2 mt-1">
+                                    <input type="radio" name="urgency" value="low" id="u-low" class="urgency-radio">
+                                    <label for="u-low" class="urgency-label text-green-400">Low</label>
+                                    <input type="radio" name="urgency" value="medium" id="u-med" class="urgency-radio">
+                                    <label for="u-med" class="urgency-label text-yellow-400">Medium</label>
+                                    <input type="radio" name="urgency" value="high" id="u-high" class="urgency-radio">
+                                    <label for="u-high" class="urgency-label text-orange-400">High</label>
+                                    <input type="radio" name="urgency" value="critical" id="u-crit" class="urgency-radio" checked>
+                                    <label for="u-crit" class="urgency-label text-red-400">Critical</label>
+                                </div>
+                            </div>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-muted mb-2">Describe the Issue</label>
+                            <textarea id="f-desc" class="form-input" rows="4" placeholder="Be specific: location, duration, impact on people..." required></textarea>
+                        </div>
+                        <div class="flex items-center gap-4 pt-2">
+                            <button type="submit" class="px-8 py-3 bg-accent hover:bg-accent-hover text-bg font-heading font-bold text-sm rounded-xl transition-all hover:scale-[1.02] active:scale-95">
+                                <i class="fas fa-paper-plane mr-2"></i>Submit Priority
+                            </button>
+                            <button type="button" id="btn-random" class="px-5 py-3 border border-brd hover:border-muted/30 text-muted hover:text-fg text-sm rounded-xl transition-all" title="Add 5 random submissions for demo">
+                                <i class="fas fa-shuffle mr-2"></i>Add Demo Data
+                            </button>
+                        </div>
+                    </form>
+                </div>
+                <!-- Live Feed -->
+                <div class="lg:col-span-2">
+                    <div class="flex items-center justify-between mb-4">
+                        <h3 class="font-heading font-semibold text-lg">Live Feed</h3>
+                        <span class="text-xs text-muted flex items-center gap-1.5"><span class="w-1.5 h-1.5 rounded-full bg-success animate-pulse"></span> Real-time</span>
+                    </div>
+                    <div id="live-feed" class="space-y-3 max-h-[520px] overflow-y-auto pr-2">
+                        <!-- Populated by JS -->
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Analyze Section -->
+    <section id="analyze-section" class="py-20 px-6 border-t border-brd">
+        <div class="max-w-3xl mx-auto text-center">
+            <div class="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-accent/10 mb-6">
+                <i class="fas fa-brain text-accent text-2xl"></i>
+            </div>
+            <h2 class="font-heading text-3xl sm:text-4xl font-bold mb-4">AI-Powered Analysis</h2>
+            <p class="text-muted max-w-xl mx-auto mb-10 leading-relaxed">
+                Our AI engine clusters submissions by category, weighs urgency and frequency, and generates a ranked priority list with concrete action plans.
+            </p>
+            <button id="btn-analyze" onclick="handleAnalyze()" class="pulse-glow px-10 py-4 bg-accent hover:bg-accent-hover text-bg font-heading font-bold text-lg rounded-2xl transition-all hover:scale-105 active:scale-95">
+                <i class="fas fa-wand-magic-sparkles mr-3"></i>Run AI Analysis
+            </button>
+            <p class="text-xs text-muted mt-4" id="analyze-hint">Analyzes all <span id="analyze-count">0</span> submissions</p>
+        </div>
+    </section>
+
+    <!-- Dashboard Section -->
+    <section id="dashboard" style="display:none" class="py-20 px-6 border-t border-brd">
+        <div class="max-w-7xl mx-auto">
+            <!-- Dashboard Header -->
+            <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-10">
+                <div>
+                    <h2 class="font-heading text-3xl font-bold mb-2">Ranked Priority Dashboard</h2>
+                    <p class="text-muted text-sm">AI-generated ranking based on frequency, urgency, and recency scoring</p>
+                </div>
+                <button onclick="handleAnalyze()" class="px-5 py-2.5 border border-accent/30 text-accent hover:bg-accent/10 font-heading font-semibold text-sm rounded-lg transition-all">
+                    <i class="fas fa-rotate mr-2"></i>Re-analyze
+                </button>
+            </div>
+
+            <!-- Ranked Priority Cards -->
+            <div id="ranked-cards" class="grid sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 mb-14">
+                <!-- Populated by JS -->
+            </div>
+
+            <!-- Charts Row -->
+            <div class="grid md:grid-cols-2 gap-6 mb-14">
+                <div class="bg-card border border-brd rounded-2xl p-6">
+                    <h3 class="font-heading font-semibold text-lg mb-4">Category Distribution</h3>
+                    <div class="relative" style="height:280px"><canvas id="chart-category"></canvas></div>
+                </div>
+                <div class="bg-card border border-brd rounded-2xl p-6">
+                    <h3 class="font-heading font-semibold text-lg mb-4">Issues by Ward</h3>
+                    <div class="relative" style="height:280px"><canvas id="chart-ward"></canvas></div>
+                </div>
+            </div>
+
+            <!-- Urgency Breakdown -->
+            <div class="bg-card border border-brd rounded-2xl p-6 mb-14">
+                <h3 class="font-heading font-semibold text-lg mb-4">Urgency Breakdown</h3>
+                <div id="urgency-bars" class="space-y-3">
+                    <!-- Populated by JS -->
+                </div>
+            </div>
+
+            <!-- Action Plan -->
+            <div class="mb-6">
+                <div class="flex items-center gap-3 mb-2">
+                    <div class="inline-flex items-center justify-center w-10 h-10 rounded-xl bg-success/10">
+                        <i class="fas fa-clipboard-list text-success"></i>
+                    </div>
+                    <div>
+                        <h3 class="font-heading text-2xl font-bold">Generated Action Plan</h3>
+                        <p class="text-muted text-sm">Top 5 priorities converted into actionable development items</p>
+                    </div>
+                </div>
+            </div>
+            <div id="action-plan" class="space-y-5 mb-8">
+                <!-- Populated by JS -->
+            </div>
+            <div id="total-budget" class="bg-accent/10 border border-accent/20 rounded-2xl p-6 flex flex-col sm:flex-row items-center justify-between gap-4">
+                <div>
+                    <div class="text-sm text-accent/70 font-medium uppercase tracking-wider">Estimated Total Budget (Top 5)</div>
+                    <div class="text-3xl font-heading font-bold text-accent mt-1" id="budget-total">--</div>
+                </div>
+                <div class="text-right">
+                    <div class="text-sm text-muted">Wards Impacted</div>
+                    <div class="text-2xl font-heading font-bold text-fg" id="wards-impacted">--</div>
+                </div>
+                <div class="text-right">
+                    <div class="text-sm text-muted">Citizens Represented</div>
+                    <div class="text-2xl font-heading font-bold text-fg" id="citizens-count">--</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="py-12 px-6 border-t border-brd">
+        <div class="max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4 text-sm text-muted">
+            <div class="flex items-center gap-2">
+                <div class="w-7 h-7 rounded-md bg-accent/20 flex items-center justify-center">
+                    <i class="fas fa-bullseye text-accent text-xs"></i>
+                </div>
+                <span class="font-heading font-semibold text-fg">People's Priorities</span>
+                <span class="text-muted/50">|</span>
+                <span>AI-Powered Hackthon by Dominators</span>
+            </div>
+            <div>Built for the hackathon — Made By Dominators</div>
+        </div>
+    </footer>
+
+    </div><!-- /#app-content -->
+
+    <script src="script.js"></script>
+</body>
+</html>
