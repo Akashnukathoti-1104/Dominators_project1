@@ -1,8 +1,8 @@
 # People's Priorities — AI-Powered Civic Governance Platform
 
 **Team Name:** Dominators
-**Team Lead:**Nukathoti Akash
-**Team member:**Siva nandha teja
+**Team Lead:** Nukathoti Akash
+**Team member:** Siva nandha teja
 
 ---
 
