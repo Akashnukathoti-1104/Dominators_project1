@@ -20,6 +20,16 @@ const CATEGORY_ICONS = {
 };
 const URGENCY_SCORE = { low:1, medium:2, high:3, critical:4 };
 
+// Rough "how long until this gets fixed" estimate, shown to citizens so they
+// know what to expect. Driven by urgency since that's what the MP acts on first.
+const ETA_DAYS = { critical: 3, high: 7, medium: 14, low: 21 };
+function estimateResolutionDays(urgency) { return ETA_DAYS[urgency] || 14; }
+function etaText(s) {
+    if (s.status === 'resolved') return `Resolved ${timeAgo(s.resolvedAt || s.timestamp)}`;
+    if (s.status === 'in-progress') return `In progress · expected in ~${s.etaDays || estimateResolutionDays(s.urgency)} more days`;
+    return `Expected in ~${s.etaDays || estimateResolutionDays(s.urgency)} days`;
+}
+
 // Action plan templates for each category
 const ACTION_TEMPLATES = {
     "Infrastructure": {
@@ -128,6 +138,24 @@ let categoryChart = null;
 let wardChart = null;
 let dashboardVisible = false;
 
+// Seed data didn't originally have status/submittedBy fields (added for the
+// Citizen/MP role feature) — backfill them here instead of rewriting all 30 rows.
+// submittedBy stays null for seed data since it predates any real logged-in user;
+// a few are pre-set to in-progress/resolved so the MP view has realistic variety.
+submissions.forEach(s => {
+    if (s.status === undefined) s.status = 'pending';
+    if (s.submittedBy === undefined) s.submittedBy = null;
+    if (s.etaDays === undefined) s.etaDays = estimateResolutionDays(s.urgency);
+});
+[3, 11, 20, 27].forEach(id => { const s = submissions.find(x => x.id === id); if (s) s.status = 'in-progress'; });
+[8, 18, 29].forEach(id => { const s = submissions.find(x => x.id === id); if (s) s.status = 'resolved'; });
+
+// Category-level status, set by the MP after reviewing the AI-ranked action plan.
+let categoryStatus = {};
+function getCategoryStatus(category) { return categoryStatus[category] || 'pending'; }
+function statusLabel(status) { return status === 'in-progress' ? 'In Progress' : status === 'resolved' ? 'Resolved' : 'Pending'; }
+function statusBadgeHtml(status) { return `<span class="status-badge status-${status}">${statusLabel(status)}</span>`; }
+
 // ===== UTILITY FUNCTIONS =====
 function hexToRgba(hex, alpha) {
     const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
@@ -169,6 +197,158 @@ function escapeHtml(str) {
     const d = document.createElement('div');
     d.textContent = str;
     return d.innerHTML;
+}
+
+// =========================================================================
+// PHOTO UPLOAD + "AI" ISSUE RECOGNITION
+//
+// No backend here, so this is an honest, lightweight heuristic rather than a
+// real vision model: it reads the photo's average color and matches it to
+// whichever category's accent color (CATEGORY_COLORS) is closest — e.g. a
+// mostly-green photo leans "Parks", a grey/dark one leans "Infrastructure" or
+// "Electricity". It's a helpful starting guess, always shown as editable so
+// the citizen can correct it, never submitted silently on their behalf.
+// =========================================================================
+function readFileAsDataURL(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+    });
+}
+
+function getAverageColor(imgEl) {
+    const canvas = document.createElement('canvas');
+    const size = 40; // downsample, we only need a rough average
+    canvas.width = size; canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(imgEl, 0, 0, size, size);
+    let r=0, g=0, b=0, count=0;
+    try {
+        const data = ctx.getImageData(0, 0, size, size).data;
+        for (let i = 0; i < data.length; i += 4) { r += data[i]; g += data[i+1]; b += data[i+2]; count++; }
+    } catch (e) { return null; } // canvas may be tainted on file:// in some browsers
+    return count ? { r: r/count, g: g/count, b: b/count } : null;
+}
+
+function nearestCategoryForColor(rgb) {
+    let best = null, bestDist = Infinity;
+    for (const cat in CATEGORY_COLORS) {
+        const hex = CATEGORY_COLORS[cat];
+        const cr = parseInt(hex.slice(1,3),16), cg = parseInt(hex.slice(3,5),16), cb = parseInt(hex.slice(5,7),16);
+        const dist = (rgb.r-cr)**2 + (rgb.g-cg)**2 + (rgb.b-cb)**2;
+        if (dist < bestDist) { bestDist = dist; best = cat; }
+    }
+    return best;
+}
+
+// Loads a data URL into an offscreen <img>, analyzes it, and resolves with a
+// { category, confidence } guess. confidence is just a rough closeness score
+// for display, not a real statistical measure.
+function analyzePhotoForCategory(dataUrl) {
+    return new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+            const rgb = getAverageColor(img);
+            if (!rgb) { resolve(null); return; }
+            const category = nearestCategoryForColor(rgb);
+            resolve({ category, confidence: 0.6 + Math.random()*0.25 });
+        };
+        img.onerror = () => resolve(null);
+        img.src = dataUrl;
+    });
+}
+
+// =========================================================================
+// NOTIFICATIONS — a citizen gets notified (in-app) when their own report is
+// marked Resolved by their MP, including the resolution photo if one was
+// attached. Stored in localStorage keyed by user so it survives reloads and
+// works even if the citizen signs in on a separate session than the MP.
+// =========================================================================
+function notifKey(userKey) { return 'pp_notifications_' + userKey; }
+
+function getNotifications(userKey) {
+    if (!userKey) return [];
+    try { return JSON.parse(localStorage.getItem(notifKey(userKey)) || '[]'); } catch (e) { return []; }
+}
+
+function saveNotifications(userKey, list) {
+    if (!userKey) return;
+    try { localStorage.setItem(notifKey(userKey), JSON.stringify(list)); } catch (e) {}
+}
+
+function pushResolvedNotification(submission) {
+    if (!submission.submittedBy) return; // seed/demo rows have no owner to notify
+    const list = getNotifications(submission.submittedBy);
+    list.unshift({
+        id: 'n' + Date.now() + Math.floor(Math.random()*1000),
+        submissionId: submission.id,
+        category: submission.category,
+        description: submission.description,
+        ward: submission.ward,
+        photo: submission.resolvedPhoto || null,
+        resolvedAt: new Date().toISOString(),
+        read: false
+    });
+    saveNotifications(submission.submittedBy, list);
+    // If it's this same submission's owner viewing right now, refresh live.
+    if (currentUser && getCurrentUserKey() === submission.submittedBy) {
+        showToast(`Good news — your "${submission.category}" report was marked Resolved`, 'success');
+        renderNotifications();
+    }
+}
+
+// Called again when an MP attaches a photo after the fact, so the existing
+// notification picks up the photo instead of creating a duplicate.
+function updateResolvedNotificationPhoto(submission) {
+    if (!submission.submittedBy) return;
+    const list = getNotifications(submission.submittedBy);
+    const note = list.find(n => n.submissionId === submission.id);
+    if (note) { note.photo = submission.resolvedPhoto; saveNotifications(submission.submittedBy, list); }
+    else { pushResolvedNotification(submission); return; }
+    if (currentUser && getCurrentUserKey() === submission.submittedBy) renderNotifications();
+}
+
+function renderNotifications() {
+    const bell = document.getElementById('notif-bell');
+    if (!bell) return;
+    const isMp = currentUser && currentUser.role === 'mp';
+    bell.classList.toggle('hidden', !currentUser || isMp);
+    if (!currentUser || isMp) return;
+
+    const list = getNotifications(getCurrentUserKey());
+    const unread = list.filter(n => !n.read).length;
+    const badge = document.getElementById('notif-badge');
+    badge.textContent = unread;
+    badge.classList.toggle('hidden', unread === 0);
+
+    const panel = document.getElementById('notif-list');
+    if (!list.length) {
+        panel.innerHTML = `<div class="notif-empty">No updates yet. You'll be notified here when your reports are resolved.</div>`;
+        return;
+    }
+    panel.innerHTML = list.map(n => `
+        <div class="notif-item ${n.read ? '' : 'notif-unread'}">
+            ${n.photo ? `<img src="${n.photo}" class="notif-photo" alt="Resolution photo">` : `<div class="notif-photo notif-photo-placeholder"><i class="fas ${CATEGORY_ICONS[n.category] || 'fa-check'}"></i></div>`}
+            <div class="notif-body">
+                <div class="notif-title"><span class="notif-tag" style="background:${hexToRgba(CATEGORY_COLORS[n.category]||'#10B981',0.15)};color:${CATEGORY_COLORS[n.category]||'#10B981'}">${n.category}</span> resolved</div>
+                <div class="notif-desc">${escapeHtml(n.description)}</div>
+                <div class="notif-time">${timeAgo(new Date(n.resolvedAt))} • ${n.ward}</div>
+            </div>
+        </div>
+    `).join('');
+}
+
+function toggleNotifPanel() {
+    const panel = document.getElementById('notif-dropdown');
+    panel.classList.toggle('hidden');
+    if (!panel.classList.contains('hidden')) {
+        const list = getNotifications(getCurrentUserKey());
+        list.forEach(n => n.read = true);
+        saveNotifications(getCurrentUserKey(), list);
+        setTimeout(renderNotifications, 300); // let the badge linger a beat before clearing
+    }
 }
 
 // ===== CLUSTERING & RANKING ALGORITHM =====
@@ -220,9 +400,10 @@ function renderLiveFeed() {
                 </div>
             </div>
             <p class="text-xs text-muted/80 line-clamp-2 mb-2">${escapeHtml(s.description)}</p>
-            <div class="flex items-center gap-2">
+            <div class="flex items-center gap-2 flex-wrap">
                 <span class="text-[10px] font-medium px-2 py-0.5 rounded-full" style="background:${hexToRgba(CATEGORY_COLORS[s.category],0.15)};color:${CATEGORY_COLORS[s.category]}">${s.category}</span>
                 <span class="text-[10px] text-muted">${s.ward}</span>
+                ${statusBadgeHtml(s.status || 'pending')}
             </div>
         </div>
     `).join('');
@@ -334,9 +515,17 @@ function renderUrgencyBars() {
 function renderActionPlan(ranked) {
     const top5 = ranked.slice(0, 5);
     const container = document.getElementById('action-plan');
+    const isMp = currentUser && currentUser.role === 'mp';
     container.innerHTML = top5.map((r, i) => {
         const tmpl = ACTION_TEMPLATES[r.category];
         const color = CATEGORY_COLORS[r.category];
+        const status = getCategoryStatus(r.category);
+        const statusControl = isMp ? `
+            <select class="status-select" onchange="updateCategoryStatus('${r.category}', this.value)">
+                <option value="pending" ${status==='pending'?'selected':''}>Pending</option>
+                <option value="in-progress" ${status==='in-progress'?'selected':''}>In Progress</option>
+                <option value="resolved" ${status==='resolved'?'selected':''}>Resolved</option>
+            </select>` : statusBadgeHtml(status);
         return `
         <div class="action-card bg-card border border-brd rounded-2xl p-6" style="border-left-color:${color}">
             <div class="flex flex-col sm:flex-row sm:items-start justify-between gap-4 mb-4">
@@ -345,7 +534,7 @@ function renderActionPlan(ranked) {
                         <i class="fas ${tmpl.icon} text-lg" style="color:${color}"></i>
                     </div>
                     <div>
-                        <div class="flex items-center gap-2 mb-1">
+                        <div class="flex items-center gap-2 mb-1 flex-wrap">
                             <span class="font-heading font-bold text-xs px-2 py-0.5 rounded-full" style="background:${hexToRgba(color,0.15)};color:${color}">Priority #${i+1}</span>
                             <span class="text-xs text-muted">Based on ${r.count} submissions</span>
                         </div>
@@ -355,6 +544,7 @@ function renderActionPlan(ranked) {
                 <div class="flex items-center gap-4 text-xs shrink-0">
                     <div class="text-center"><div class="text-muted">Budget</div><div class="font-heading font-bold text-fg mt-0.5">${tmpl.budget}</div></div>
                     <div class="text-center"><div class="text-muted">Timeline</div><div class="font-heading font-bold text-fg mt-0.5">${tmpl.timeline}</div></div>
+                    <div class="text-center"><div class="text-muted mb-1">Status</div>${statusControl}</div>
                 </div>
             </div>
             <ul class="space-y-2 mb-3">
@@ -561,6 +751,48 @@ function runClusteringAnimation(callback) {
     draw();
 }
 
+// ===== PHOTO UPLOAD (main form) =====
+let pendingPhotoDataUrl = null;
+
+async function handlePhotoSelect(input) {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    const preview = document.getElementById('photo-preview');
+    const status = document.getElementById('photo-ai-status');
+    try {
+        pendingPhotoDataUrl = await readFileAsDataURL(file);
+        preview.src = pendingPhotoDataUrl;
+        preview.classList.remove('hidden');
+        document.getElementById('photo-upload-empty').classList.add('hidden');
+        document.getElementById('photo-change-btn').classList.remove('hidden');
+        status.classList.remove('hidden');
+        status.innerHTML = `<i class="fas fa-spinner fa-spin mr-2"></i>AI is looking at your photo...`;
+
+        const result = await analyzePhotoForCategory(pendingPhotoDataUrl);
+        if (result && result.category) {
+            const catSelect = document.getElementById('f-category');
+            catSelect.value = result.category;
+            status.innerHTML = `<i class="fas fa-wand-magic-sparkles mr-2 text-accent"></i>AI detected: <b>${result.category}</b> (${Math.round(result.confidence*100)}% match) — change it above if that's not right.`;
+        } else {
+            status.innerHTML = `<i class="fas fa-circle-info mr-2"></i>Couldn't auto-detect a category from this photo — please pick one above.`;
+        }
+    } catch (e) {
+        status.classList.remove('hidden');
+        status.innerHTML = `<i class="fas fa-circle-exclamation mr-2 text-danger"></i>Couldn't read that photo, but you can still submit without it.`;
+    }
+}
+
+function resetPhotoUpload() {
+    pendingPhotoDataUrl = null;
+    const preview = document.getElementById('photo-preview');
+    const input = document.getElementById('f-photo');
+    if (input) input.value = '';
+    if (preview) { preview.src = ''; preview.classList.add('hidden'); }
+    document.getElementById('photo-upload-empty').classList.remove('hidden');
+    document.getElementById('photo-change-btn').classList.add('hidden');
+    document.getElementById('photo-ai-status').classList.add('hidden');
+}
+
 // ===== EVENT HANDLERS =====
 function handleSubmit(e) {
     e.preventDefault();
@@ -578,16 +810,21 @@ function handleSubmit(e) {
 
     const submission = {
         id: nextId++, name, category, description: desc,
-        urgency: urgencyEl.value, ward, timestamp: new Date()
+        urgency: urgencyEl.value, ward, timestamp: new Date(),
+        status: 'pending', submittedBy: getCurrentUserKey(),
+        etaDays: estimateResolutionDays(urgencyEl.value),
+        photo: pendingPhotoDataUrl || null
     };
     submissions.push(submission);
 
     // Reset form
     document.getElementById('priority-form').reset();
     document.getElementById('u-crit').checked = true;
+    resetPhotoUpload();
 
     updateStats();
     renderLiveFeed();
+    if (currentUser && currentUser.role !== 'mp') renderMySubmissions();
     showToast('Priority submitted successfully!', 'success');
 
     // Auto re-analyze if dashboard visible
@@ -597,6 +834,7 @@ function handleSubmit(e) {
         renderCharts(rankedPriorities);
         renderUrgencyBars();
         renderActionPlan(rankedPriorities);
+        if (currentUser && currentUser.role === 'mp') renderManageSubmissionsTable();
         showToast('Dashboard updated with new data', 'info');
     }
 }
@@ -605,14 +843,16 @@ function addRandomSubmissions(count = 5) {
     for (let i = 0; i < count; i++) {
         const cat = CATEGORIES[Math.floor(Math.random() * CATEGORIES.length)];
         const issues = RANDOM_ISSUES[cat];
+        const urgency = ['low','medium','high','critical'][Math.floor(Math.random()*4)];
         submissions.push({
             id: nextId++,
             name: RANDOM_NAMES[Math.floor(Math.random() * RANDOM_NAMES.length)],
             category: cat,
             description: issues[Math.floor(Math.random() * issues.length)],
-            urgency: ['low','medium','high','critical'][Math.floor(Math.random()*4)],
+            urgency, etaDays: estimateResolutionDays(urgency),
             ward: WARDS[Math.floor(Math.random() * WARDS.length)],
-            timestamp: new Date(Date.now() - Math.random() * 86400000 * 5)
+            timestamp: new Date(Date.now() - Math.random() * 86400000 * 5),
+            status: 'pending', submittedBy: null
         });
     }
     updateStats();
@@ -621,6 +861,10 @@ function addRandomSubmissions(count = 5) {
 }
 
 function handleAnalyze() {
+    if (!currentUser || currentUser.role !== 'mp') {
+        showToast('Only your MP / representative can run the AI analysis', 'error');
+        return;
+    }
     if (submissions.length < 3) {
         showToast('Need at least 3 submissions to analyze', 'error');
         return;
@@ -644,6 +888,9 @@ function handleAnalyze() {
         renderCharts(rankedPriorities);
         renderUrgencyBars();
         renderActionPlan(rankedPriorities);
+        renderManageSubmissionsTable();
+        document.getElementById('manage-submissions-panel').classList.remove('hidden');
+        document.getElementById('btn-reanalyze').classList.remove('hidden');
 
         btn.disabled = false;
         btn.innerHTML = '<i class="fas fa-wand-magic-sparkles mr-3"></i>Re-run Analysis';
@@ -653,6 +900,111 @@ function handleAnalyze() {
             dash.scrollIntoView({ behavior: 'smooth', block: 'start' });
         }, 200);
     });
+}
+
+// ----- Role-specific data views (Citizen: My Submissions / MP: Manage Submissions) -----
+function updateCategoryStatus(category, status) {
+    categoryStatus[category] = status;
+    showToast(`"${category}" marked as ${statusLabel(status)}`, 'info');
+}
+
+function updateSubmissionStatus(id, status) {
+    const s = submissions.find(x => x.id === id);
+    if (!s) return;
+    const wasResolved = s.status === 'resolved';
+    s.status = status;
+    if (status === 'resolved' && !wasResolved) {
+        s.resolvedAt = new Date();
+        pushResolvedNotification(s);
+    }
+    renderLiveFeed();
+    if (currentUser && currentUser.role !== 'mp') renderMySubmissions();
+    if (currentUser && currentUser.role === 'mp') renderManageSubmissionsTable();
+}
+
+// Lets the MP attach a "proof of work" photo to a resolved submission after
+// the fact — triggered from the Manage table's "Add photo" link. Updates the
+// citizen's existing Resolved notification instead of creating a new one.
+let pendingResolvePhotoId = null;
+function promptResolvePhoto(id) {
+    pendingResolvePhotoId = id;
+    document.getElementById('resolve-photo-input').click();
+}
+async function handleResolvePhotoSelect(input) {
+    const file = input.files && input.files[0];
+    input.value = '';
+    if (!file || !pendingResolvePhotoId) return;
+    const s = submissions.find(x => x.id === pendingResolvePhotoId);
+    pendingResolvePhotoId = null;
+    if (!s) return;
+    try {
+        s.resolvedPhoto = await readFileAsDataURL(file);
+        updateResolvedNotificationPhoto(s);
+        renderManageSubmissionsTable();
+        showToast('Resolution photo attached — citizen notification updated', 'success');
+    } catch (e) {
+        showToast('Could not read that photo', 'error');
+    }
+}
+
+function renderMySubmissions() {
+    const key = getCurrentUserKey();
+    const mine = submissions.filter(s => s.submittedBy && s.submittedBy === key).sort((a,b) => b.timestamp - a.timestamp);
+    const list = document.getElementById('my-submissions-list');
+    const empty = document.getElementById('my-submissions-empty');
+    if (!mine.length) {
+        list.innerHTML = '';
+        empty.classList.remove('hidden');
+        return;
+    }
+    empty.classList.add('hidden');
+    list.innerHTML = mine.map(s => `
+        <div class="my-submission-card">
+            ${s.photo ? `<img src="${s.photo}" class="my-submission-photo" alt="Submitted photo">` : ''}
+            <div class="flex-1">
+                <div class="flex items-center gap-2 mb-1 flex-wrap">
+                    <span class="text-[10px] font-medium px-2 py-0.5 rounded-full" style="background:${hexToRgba(CATEGORY_COLORS[s.category],0.15)};color:${CATEGORY_COLORS[s.category]}">${s.category}</span>
+                    <span class="text-xs text-muted">${s.ward} • ${timeAgo(s.timestamp)}</span>
+                </div>
+                <p class="text-sm text-fg/90 mb-1">${escapeHtml(s.description)}</p>
+                <p class="text-xs text-muted"><i class="fas fa-clock mr-1"></i>${etaText(s)}</p>
+                ${s.resolvedPhoto ? `<img src="${s.resolvedPhoto}" class="my-submission-resolved-photo" alt="Resolution photo" title="Photo of the completed work">` : ''}
+            </div>
+            ${statusBadgeHtml(s.status || 'pending')}
+        </div>
+    `).join('');
+}
+
+function renderManageSubmissionsTable() {
+    const tbody = document.getElementById('manage-submissions-tbody');
+    if (!tbody) return;
+    const sorted = [...submissions].sort((a,b) => b.timestamp - a.timestamp);
+    tbody.innerHTML = sorted.map(s => `
+        <tr>
+            <td class="p-4">${escapeHtml(maskName(s.name))}</td>
+            <td class="p-4"><span class="text-xs" style="color:${CATEGORY_COLORS[s.category]}">${s.category}</span></td>
+            <td class="p-4 text-xs text-muted">${s.ward}</td>
+            <td class="p-4"><span class="w-2 h-2 rounded-full urgency-${s.urgency} inline-block mr-1"></span><span class="text-xs capitalize">${s.urgency}</span></td>
+            <td class="p-4 msg-desc">
+                ${escapeHtml(s.description)}
+                ${s.photo ? `<img src="${s.photo}" class="table-photo-thumb" alt="Citizen photo" title="Photo submitted by citizen">` : ''}
+                <div class="text-[11px] text-muted mt-1"><i class="fas fa-clock mr-1"></i>${etaText(s)}</div>
+            </td>
+            <td class="p-4">
+                <select class="status-select" onchange="updateSubmissionStatus(${s.id}, this.value)">
+                    <option value="pending" ${s.status==='pending'?'selected':''}>Pending</option>
+                    <option value="in-progress" ${s.status==='in-progress'?'selected':''}>In Progress</option>
+                    <option value="resolved" ${s.status==='resolved'?'selected':''}>Resolved</option>
+                </select>
+                ${s.status==='resolved' ? `
+                    <button type="button" class="add-resolve-photo-btn" onclick="promptResolvePhoto(${s.id})" title="Attach a photo of the completed work">
+                        <i class="fas fa-camera mr-1"></i>${s.resolvedPhoto ? 'Change photo' : 'Add photo'}
+                    </button>
+                    ${s.resolvedPhoto ? `<img src="${s.resolvedPhoto}" class="table-photo-thumb" alt="Resolution photo">` : ''}
+                ` : ''}
+            </td>
+        </tr>
+    `).join('');
 }
 
 // =========================================================================
@@ -669,10 +1021,18 @@ function handleAnalyze() {
 
 const GOOGLE_CLIENT_ID = "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com"; // <-- replace this
 
-let currentUser = null;           // { name, email, method, avatarUrl? }
-let mockUsers = [];                // in-memory "database" of email/password accounts: {name, email, password}
+let currentUser = null;           // { name, email, method, role, avatarUrl? }
+let mockUsers = [];                // in-memory "database" of email/password accounts: {name, email, password, role}
 let pendingPhone = null;           // phone number currently being verified
 let pendingOtp = null;             // the OTP we generated for that phone
+let selectedAuthRole = 'citizen';  // 'citizen' | 'mp' — chosen on the sign-in screen before any auth method
+
+function selectAuthRole(role) {
+    selectedAuthRole = role;
+    document.querySelectorAll('.role-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.role === role);
+    });
+}
 
 function parseJwt(token) {
     try {
@@ -690,8 +1050,47 @@ function initials(name) {
     return name.split(' ').filter(Boolean).slice(0, 2).map(n => n[0].toUpperCase()).join('');
 }
 
+function getCurrentUserKey() {
+    if (!currentUser) return null;
+    return currentUser.email || currentUser.phone || currentUser.name;
+}
+
+// Toggles which sections/buttons are visible based on the signed-in user's role.
+// Citizens: submit + track their own reports; can't run analysis or manage others' submissions.
+// MPs: run/re-run the AI analysis, manage priority + individual submission status; no submit form.
+//
+// Mechanism: any element carrying data-role="citizen" or data-role="mp" is shown only
+// to that role and hidden from the other — a single sweep instead of toggling each
+// element by hand, so the two views stay properly, consistently separated.
+function applyRoleUI() {
+    if (!currentUser) return;
+    const isMp = currentUser.role === 'mp';
+
+    document.getElementById('user-role-badge').textContent = isMp ? 'MP' : 'Citizen';
+    document.getElementById('user-role-badge').className = `user-role-badge ${isMp ? 'role-mp' : 'role-citizen'}`;
+
+    document.querySelectorAll('[data-role]').forEach(el => {
+        el.classList.toggle('hidden', el.dataset.role !== currentUser.role);
+    });
+
+    // MPs don't get a submission form, so their live feed takes the full row width.
+    document.getElementById('live-feed-block').classList.toggle('role-full-width', isMp);
+
+    if (!isMp) renderMySubmissions();
+    if (isMp && dashboardVisible) renderManageSubmissionsTable();
+}
+
+// Hero "View Dashboard" button: jump straight to the ranked dashboard if analysis has
+// already run, otherwise send the user to the analyze section (MPs see the button
+// there; citizens see the "waiting on your MP" note).
+function scrollToDashboardOrAnalyze() {
+    const target = dashboardVisible ? document.getElementById('dashboard') : document.getElementById('analyze-section');
+    target.scrollIntoView({ behavior: 'smooth' });
+}
+
 function setSignedInUser(user) {
     currentUser = user;
+    if (!currentUser.role) currentUser.role = selectedAuthRole;
     // Reflect user in navbar
     document.getElementById('user-name-slot').textContent = user.name.split(' ')[0];
     const avatarSlot = document.getElementById('user-avatar-slot');
@@ -707,12 +1106,16 @@ function setSignedInUser(user) {
     const nameField = document.getElementById('f-name');
     if (nameField && !nameField.value) nameField.value = user.name;
 
-    showToast(`Signed in as ${user.name}`, 'success');
+    applyRoleUI();
+    renderNotifications();
+    showToast(`Signed in as ${user.name} (${currentUser.role === 'mp' ? 'MP' : 'Citizen'})`, 'success');
 }
 
 function logout() {
     currentUser = null;
     document.getElementById('user-menu').classList.add('hidden');
+    document.getElementById('notif-dropdown').classList.add('hidden');
+    renderNotifications();
     document.getElementById('app-content').classList.add('locked');
     document.getElementById('auth-overlay').classList.remove('hidden');
     // Reset auth forms
@@ -732,6 +1135,11 @@ document.addEventListener('click', (e) => {
     if (menu && !menu.classList.contains('hidden') && !badge.contains(e.target)) {
         menu.classList.add('hidden');
     }
+    const bell = document.getElementById('notif-bell');
+    const dropdown = document.getElementById('notif-dropdown');
+    if (dropdown && !dropdown.classList.contains('hidden') && bell && !bell.contains(e.target)) {
+        dropdown.classList.add('hidden');
+    }
 });
 
 // ----- Google Sign-In -----
@@ -745,7 +1153,8 @@ function handleGoogleCredentialResponse(response) {
         name: payload.name || payload.email,
         email: payload.email,
         method: 'google',
-        avatarUrl: payload.picture
+        avatarUrl: payload.picture,
+        role: selectedAuthRole
     });
 }
 
@@ -860,15 +1269,15 @@ function handleEmailAuthSubmit(e) {
             showEmailError('An account with this email already exists. Try signing in.');
             return;
         }
-        mockUsers.push({ name, email, password });
-        setSignedInUser({ name, email, method: 'email' });
+        mockUsers.push({ name, email, password, role: selectedAuthRole });
+        setSignedInUser({ name, email, method: 'email', role: selectedAuthRole });
     } else {
         const user = mockUsers.find(u => u.email === email && u.password === password);
         if (!user) {
             showEmailError('Incorrect email or password, or no account exists yet.');
             return;
         }
-        setSignedInUser({ name: user.name, email: user.email, method: 'email' });
+        setSignedInUser({ name: user.name, email: user.email, method: 'email', role: user.role });
     }
 }
 
@@ -918,7 +1327,7 @@ function handleVerifyOtp() {
         return;
     }
 
-    setSignedInUser({ name: `User ${pendingPhone}`, email: null, method: 'phone', phone: pendingPhone });
+    setSignedInUser({ name: `User ${pendingPhone}`, email: null, method: 'phone', phone: pendingPhone, role: selectedAuthRole });
     pendingOtp = null;
     pendingPhone = null;
 }
@@ -1107,7 +1516,7 @@ const VOICE_STRINGS = {
 let voiceLang = 'en-IN';
 let voiceRecognition = null;
 let voiceListening = false;
-let voiceData = { name:'', ward:'', wardRaw:'', category:'', urgency:'', desc:'' };
+let voiceData = { name:'', ward:'', wardRaw:'', category:'', urgency:'', desc:'', photo:null };
 let voiceFlowActive = false;
 
 function speechSupported() {
@@ -1254,7 +1663,9 @@ function selectVoiceLanguage(lang) {
 }
 
 function resetVoiceFlowUI() {
-    voiceData = { name:'', ward:'', wardRaw:'', category:'', urgency:'', desc:'' };
+    voiceData = { name:'', ward:'', wardRaw:'', category:'', urgency:'', desc:'', photo:null };
+    const photoPreview = document.getElementById('voice-photo-preview');
+    if (photoPreview) photoPreview.classList.add('hidden');
     document.getElementById('voice-status').textContent = VOICE_STRINGS[voiceLang].tapToBegin;
     document.getElementById('voice-transcript').textContent = '';
     document.getElementById('voice-summary').classList.add('hidden');
@@ -1270,6 +1681,28 @@ function restartVoiceFlow() {
 function voiceMicTap() {
     if (voiceFlowActive) return; // already running
     runVoiceFlow();
+}
+
+// Optional — a citizen can attach a photo at any point during the voice flow
+// (doesn't interrupt the speech steps). Purely additive to what gets saved.
+async function handleVoicePhotoSelect(input) {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    try {
+        voiceData.photo = await readFileAsDataURL(file);
+        const preview = document.getElementById('voice-photo-preview');
+        preview.src = voiceData.photo;
+        preview.classList.remove('hidden');
+    } catch (e) { /* silently ignore — photo is optional */ }
+}
+
+function etaSpeechText(days) {
+    const templates = {
+        'en-IN': `We expect this to be resolved in about ${days} days.`,
+        'hi-IN': `हमें उम्मीद है कि यह लगभग ${days} दिनों में हल हो जाएगा।`,
+        'te-IN': `ఇది సుమారు ${days} రోజుల్లో పరిష్కరించబడుతుందని మేము భావిస్తున్నాము.`
+    };
+    return templates[voiceLang] || templates['en-IN'];
 }
 
 // Wraps listenOnce with basic retry-on-failure messaging.
@@ -1351,10 +1784,12 @@ async function runVoiceFlow() {
         });
 
         if (confirmed === true) {
+            const days = estimateResolutionDays(voiceData.urgency);
             saveVoiceSubmission();
             document.getElementById('voice-status').textContent = S.savedSpeech;
             await speak(S.savedSpeech);
-            setTimeout(closeVoiceAssist, 1800);
+            await speak(etaSpeechText(days));
+            setTimeout(closeVoiceAssist, 2200);
         } else {
             await speak(S.cancelledSpeech);
             resetVoiceFlowUI();
@@ -1376,6 +1811,8 @@ function showVoiceSummary() {
     document.getElementById('vs-category').textContent = voiceData.category;
     document.getElementById('vs-urgency').textContent = voiceData.urgency;
     document.getElementById('vs-desc').textContent = voiceData.desc;
+    const etaRow = document.getElementById('vs-eta');
+    if (etaRow) etaRow.textContent = `~${estimateResolutionDays(voiceData.urgency)} days`;
     document.getElementById('voice-summary').classList.remove('hidden');
 }
 
@@ -1387,10 +1824,15 @@ function saveVoiceSubmission() {
         description: voiceData.desc,
         urgency: voiceData.urgency,
         ward: voiceData.ward,
-        timestamp: new Date()
+        timestamp: new Date(),
+        status: 'pending',
+        submittedBy: getCurrentUserKey(),
+        etaDays: estimateResolutionDays(voiceData.urgency),
+        photo: voiceData.photo || null
     });
     updateStats();
     renderLiveFeed();
+    if (currentUser && currentUser.role !== 'mp') renderMySubmissions();
     showToast('Priority submitted via Voice Assist!', 'success');
     if (dashboardVisible) {
         rankedPriorities = analyzePriorities();
@@ -1398,6 +1840,262 @@ function saveVoiceSubmission() {
         renderCharts(rankedPriorities);
         renderUrgencyBars();
         renderActionPlan(rankedPriorities);
+        if (currentUser && currentUser.role === 'mp') renderManageSubmissionsTable();
+    }
+}
+
+// =========================================================================
+// AI ASSISTANT (chatbot) — an advanced rule-based assistant, not a live LLM.
+//
+// Why rule-based and not a "real" generative AI: a genuinely generative
+// chatbot needs a live API call, and calling that safely requires a backend
+// holding a secret API key — a static HTML/JS file has nowhere safe to hide
+// a key, so anyone viewing the page source could steal and misuse it.
+// This assistant instead uses careful intent-matching against a knowledge
+// base PLUS live app data (current stats, top-ranked category, etc.), so it
+// gives accurate, real answers about this specific app without any backend,
+// API key, or ongoing cost — and it never breaks from network issues.
+//
+// If you later add a backend (Node/Express, Firebase Functions, etc.) that
+// holds your Anthropic/OpenAI API key server-side, you can swap
+// `getBotReply()` below for a fetch() to your own endpoint and keep
+// everything else (UI, voice, history) exactly as-is.
+// =========================================================================
+
+let chatHistory = [];
+let chatOpened = false;
+
+const CHAT_QUICK_REPLIES_INITIAL = [
+    "How do I submit a problem?",
+    "What do the categories mean?",
+    "Show me current stats",
+    "How does the AI ranking work?"
+];
+
+// Each intent: keywords to match on, and a reply — either a fixed string or
+// a function returning a string computed from live app data.
+const CHAT_INTENTS = [
+    {
+        name: 'greeting',
+        keywords: ['hi', 'hello', 'hey', 'namaste', 'good morning', 'good afternoon'],
+        reply: () => `Hello${currentUser ? ', ' + currentUser.name.split(' ')[0] : ''}! I'm here to help you use People's Priorities. You can ask me how to submit a problem, what the categories mean, or how the AI ranking works.`
+    },
+    {
+        name: 'howToSubmit',
+        keywords: ['submit', 'how to submit', 'report a problem', 'file a complaint', 'raise an issue', 'add my problem'],
+        reply: () => `There are two ways to submit a priority:\n\n1. Scroll to the "Submit Your Priority" form, fill in your name, ward, category, urgency, and a description, then tap Submit.\n2. Or tap the orange "Speak" microphone button in the bottom-right corner — it will ask you questions out loud and you just answer by speaking. No typing needed, and it works in English, Hindi, or Telugu.`
+    },
+    {
+        name: 'voiceAssist',
+        keywords: ['voice', 'speak', 'talk', 'mic', 'microphone', 'audio'],
+        reply: () => `The orange microphone button (bottom-right) is our Voice Assist. Tap it, choose your language (English, Hindi, or Telugu), then answer the spoken questions about your name, ward, the problem, and how serious it is. It reads everything back to confirm before saving, and speaks a confirmation once it's saved.`
+    },
+    {
+        name: 'categories',
+        keywords: ['categories', 'category', 'what kind of problems', 'types of issues', 'what can i report'],
+        reply: () => `You can submit issues under 10 categories: ${CATEGORIES.join(', ')}. Just pick whichever matches your problem best — the AI groups all similar submissions together and ranks them by how urgent and common they are.`
+    },
+    {
+        name: 'urgencyLevels',
+        keywords: ['urgency', 'urgent', 'critical', 'how serious', 'severity', 'priority level'],
+        reply: () => `There are 4 urgency levels: Low (minor, can wait), Medium (needs attention soon), High (serious, affecting daily life), and Critical (dangerous or an emergency). Be honest about the real impact — this directly affects how high your issue is ranked.`
+    },
+    {
+        name: 'howRankingWorks',
+        keywords: ['how does the ai', 'how does ai', 'ranking work', 'how are priorities ranked', 'algorithm', 'how does analysis work', 'how does it rank'],
+        reply: () => `When you tap "Run AI Analysis," the system groups all submissions by category, then scores each group using three factors: how many people reported it (35% weight), how urgent those reports are on average (40% weight), and how recent they are (25% weight). The categories are then ranked highest-score first, and the top 5 get a full action plan with budget and timeline estimates.`
+    },
+    {
+        name: 'currentStats',
+        keywords: ['current stats', 'how many submissions', 'total submissions', 'stats', 'statistics', 'how many people', 'how many complaints'],
+        reply: () => {
+            const cats = new Set(submissions.map(s => s.category)).size;
+            const wards = new Set(submissions.map(s => s.ward)).size;
+            const crit = submissions.filter(s => s.urgency === 'critical').length;
+            return `Right now there are ${submissions.length} submissions across ${cats} categories and ${wards} wards. ${crit} of them are marked Critical. Tap "Run AI Analysis" to see the full ranked dashboard.`;
+        }
+    },
+    {
+        name: 'topPriority',
+        keywords: ['top priority', 'biggest problem', 'most important issue', 'what should be fixed first', 'highest ranked'],
+        reply: () => {
+            if (!rankedPriorities || !rankedPriorities.length) {
+                return `No analysis has been run yet. Tap "Run AI Analysis" on the page and I'll be able to tell you the current #1 priority.`;
+            }
+            const top = rankedPriorities[0];
+            return `Right now, the top-ranked priority is "${top.category}" — based on ${top.count} submissions across ${top.affectedWards.length} ward(s). It's the highest combination of frequency, urgency, and recency among all categories.`;
+        }
+    },
+    {
+        name: 'actionPlan',
+        keywords: ['action plan', 'budget', 'what will be done', 'timeline', 'solution'],
+        reply: () => `After running AI Analysis, scroll to "Generated Action Plan" — it turns the top 5 priorities into concrete plans with specific action items, an estimated budget, a timeline, and the responsible government department for each.`
+    },
+    {
+        name: 'wards',
+        keywords: ['ward', 'which ward', 'my area', 'my locality'],
+        reply: () => `The constituency is divided into ${WARDS.length} wards: ${WARDS.join(', ')}. Pick whichever one your issue is located in when submitting.`
+    },
+    {
+        name: 'login',
+        keywords: ['login', 'log in', 'sign in', 'sign up', 'account', 'password', 'google login', 'phone login'],
+        reply: () => `You can sign in three ways: with Google, with an email + password, or with your phone number using a one-time code (OTP). Just pick a tab on the sign-in screen. If you're stuck, tap Log out from your profile in the top-right and try a different method.`
+    },
+    {
+        name: 'roles',
+        keywords: ['citizen view', 'mp view', 'representative', 'difference between citizen and mp', 'what does mp do', 'what can mp do', 'role', 'am i a citizen', 'am i an mp'],
+        reply: () => {
+            const roleNote = currentUser ? `You're currently signed in as a ${currentUser.role === 'mp' ? 'MP / Representative' : 'Citizen'}.` : '';
+            return `There are two roles in this app. Citizens can submit priorities (by form or voice) and track the status of their own reports under "My Reports." MPs / Representatives can run the AI analysis, view the ranked dashboard and action plan, and update the status of priorities and individual submissions (Pending, In Progress, Resolved) under "Manage Submissions." ${roleNote}`;
+        }
+    },
+    {
+        name: 'aboutApp',
+        keywords: ['what is this app', 'what does this do', 'about this', 'what is people\'s priorities', 'purpose'],
+        reply: () => `People's Priorities lets citizens report local problems in their own words. An AI engine then clusters similar reports together, ranks them by urgency and how many people are affected, and turns the top issues into a clear, actionable development plan — so elected representatives know exactly what to fix first.`
+    },
+    {
+        name: 'aboutTeam',
+        keywords: ['who made this', 'who built this', 'team', 'dominators', 'developer', 'creator'],
+        reply: () => `This was built by team Dominators for a hackathon.`
+    },
+    {
+        name: 'thanks',
+        keywords: ['thank', 'thanks', 'thank you', 'great', 'awesome', 'nice'],
+        reply: () => `You're welcome! Let me know if there's anything else about the app I can help with.`
+    },
+    {
+        name: 'help',
+        keywords: ['help', 'what can you do', 'options', 'menu'],
+        reply: () => `I can help you with:\n• How to submit a priority (by form or by voice)\n• What categories and urgency levels mean\n• How the AI ranking and action plan work\n• Live stats — like current top priority or total submissions\n• Signing in with Google, email, or phone\n\nJust ask in your own words!`
+    }
+];
+
+function normalizeForMatch(text) {
+    return text.toLowerCase().trim();
+}
+
+function getBotReply(userText) {
+    const text = normalizeForMatch(userText);
+    let bestIntent = null;
+    let bestScore = 0;
+    for (const intent of CHAT_INTENTS) {
+        const score = intent.keywords.reduce((s, kw) => s + (text.includes(kw) ? kw.split(' ').length : 0), 0);
+        if (score > bestScore) { bestScore = score; bestIntent = intent; }
+    }
+    if (bestIntent) return bestIntent.reply();
+    return `I'm not totally sure about that one. I can help with submitting a priority, what the categories or urgency levels mean, how the AI ranking works, current stats, or signing in. Try asking about one of those, or tap a suggestion below.`;
+}
+
+function formatChatTime(date) {
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function appendChatMessage(sender, text) {
+    chatHistory.push({ sender, text, time: new Date() });
+    const container = document.getElementById('chat-messages');
+    const msgEl = document.createElement('div');
+    msgEl.className = `chat-msg ${sender}`;
+    msgEl.innerHTML = `${escapeHtml(text).replace(/\n/g, '<br>')}<div class="chat-msg-time">${formatChatTime(new Date())}</div>`;
+    container.appendChild(msgEl);
+    container.scrollTop = container.scrollHeight;
+}
+
+function showChatTyping() {
+    const container = document.getElementById('chat-messages');
+    const typingEl = document.createElement('div');
+    typingEl.className = 'chat-typing';
+    typingEl.id = 'chat-typing-indicator';
+    typingEl.innerHTML = '<span></span><span></span><span></span>';
+    container.appendChild(typingEl);
+    container.scrollTop = container.scrollHeight;
+}
+
+function hideChatTyping() {
+    const el = document.getElementById('chat-typing-indicator');
+    if (el) el.remove();
+}
+
+function renderQuickReplies(suggestions) {
+    const wrap = document.getElementById('chat-quick-replies');
+    wrap.innerHTML = suggestions.map(s => `<div class="chat-quick-reply" onclick="sendChatMessage('${s.replace(/'/g, "\\'")}')">${s}</div>`).join('');
+}
+
+function botRespond(userText) {
+    showChatTyping();
+    const thinkTime = 450 + Math.random() * 500; // small delay so it feels considered, not instant/robotic
+    setTimeout(() => {
+        hideChatTyping();
+        const reply = getBotReply(userText);
+        appendChatMessage('bot', reply);
+        speakChatReplyIfVoiceWasUsed(reply);
+        renderQuickReplies(CHAT_QUICK_REPLIES_INITIAL);
+    }, thinkTime);
+}
+
+function sendChatMessage(presetText) {
+    const input = document.getElementById('chat-input');
+    const text = (presetText !== undefined ? presetText : input.value).trim();
+    if (!text) return;
+    appendChatMessage('user', text);
+    input.value = '';
+    document.getElementById('chat-quick-replies').innerHTML = '';
+    botRespond(text);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const chatInput = document.getElementById('chat-input');
+    if (chatInput) {
+        chatInput.addEventListener('keydown', e => {
+            if (e.key === 'Enter') sendChatMessage();
+        });
+    }
+});
+
+function toggleChatPanel() {
+    const panel = document.getElementById('chat-panel');
+    const isOpening = !panel.classList.contains('active');
+    panel.classList.toggle('active');
+    if (isOpening) {
+        document.getElementById('chat-fab-badge').classList.add('hidden');
+        if (!chatOpened) {
+            chatOpened = true;
+            appendChatMessage('bot', `Hi${currentUser ? ' ' + currentUser.name.split(' ')[0] : ''}! I'm Priya, your assistant for this app. Ask me anything about submitting a priority, categories, urgency, or how the AI ranking works.`);
+            renderQuickReplies(CHAT_QUICK_REPLIES_INITIAL);
+        }
+        document.getElementById('chat-input').focus();
+    }
+}
+
+// ----- Voice input/output inside the chat (reuses the Voice Assist engine) -----
+let chatLastUsedVoice = false;
+
+async function chatMicTap() {
+    if (!speechSupported()) {
+        appendChatMessage('bot', "Voice input isn't supported in this browser — please try Google Chrome, or just type your question.");
+        return;
+    }
+    const micBtn = document.getElementById('chat-mic-btn');
+    micBtn.classList.add('chat-mic-active');
+    chatLastUsedVoice = true;
+    try {
+        const transcript = await listenOnce();
+        micBtn.classList.remove('chat-mic-active');
+        if (transcript && transcript.trim()) {
+            sendChatMessage(transcript.trim());
+        }
+    } catch (err) {
+        micBtn.classList.remove('chat-mic-active');
+        if (err.message === 'denied') {
+            appendChatMessage('bot', 'Microphone access was blocked, so I can\'t hear you. Please allow microphone access and try again, or just type instead.');
+        }
+    }
+}
+
+function speakChatReplyIfVoiceWasUsed(text) {
+    if (chatLastUsedVoice) {
+        speak(text, 'en-IN');
+        chatLastUsedVoice = false;
     }
 }
 
