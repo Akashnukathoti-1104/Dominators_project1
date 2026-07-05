@@ -74,12 +74,11 @@ To enable real Google Sign-In, replace `GOOGLE_CLIENT_ID` in `script.js` with yo
 - Phone OTP is simulated locally (no real SMS gateway)
 
 ## Live Demo
-
-_[Add your deployed Render/GitHub Pages link here]_
+Live Demo:(https://dominators-project1.onrender.com)
 
 ## Repository
 
-_[Add your GitHub repo link here]_
+GitHub link:[https://github.com/Akashnukathoti-1104/Dominators_project1]
 
 ---
-*Submitted as part of the CodTech IT Solutions Pvt. Ltd. Cybersecurity & Ethical Hacking Internship — Task Submission.*
+*Submitted as part of the Hackathon at Gitam University*
