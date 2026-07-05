@@ -1,11 +1,8 @@
 # People's Priorities — AI-Powered Civic Governance Platform
 
-**Company:** CODTECH IT SOLUTIONS PVT. LTD.
-**Name:** Akash Nukathoti
-**Intern ID:** CITS2003
-**Domain:** Cybersecurity & Ethical Hacking
-**Duration:** 6 Weeks
-**Mentor:** _[Add mentor name]_
+**Team Name:** Dominators
+**Team Lead:**Nukathoti Akash
+**Team member:**Siva nandha teja
 
 ---
 
@@ -63,8 +60,6 @@ No build step required.
    — or serve the folder with any static server, e.g.:
    npx serve .
 ```
-
-To enable real Google Sign-In, replace `GOOGLE_CLIENT_ID` in `script.js` with your own OAuth Client ID from the [Google Cloud Console](https://console.cloud.google.com/apis/credentials).
 
 ## Known Limitations (by design, for a hackathon/demo scope)
 
